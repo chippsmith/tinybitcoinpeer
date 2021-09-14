@@ -30,63 +30,85 @@
 #     actually respond with IP addresses for random nodes in the
 #     network.
 #
-# - After the handshake, a "message handler" is installed as a 
-#     background thread. This handler logs every message 
-#     received, and responds to "Ping" challenges. It is easy 
+# - After the handshake, a "message handler" is installed as a
+#     background thread. This handler logs every message
+#     received, and responds to "Ping" challenges. It is easy
 #     to add more reactive behaviors too.
-# 
+#
 # - This shows off a versatile way to use gevent threads, in
-#     multiple ways at once. After forking off the handler 
+#     multiple ways at once. After forking off the handler
 #     thread, the main thread also keeps around a tee of the
 #     stream, making it easy to write sequential schedules.
-#     This code periodically sends ping messages, sleeping 
-#     in between. Additional threads could be given their 
+#     This code periodically sends ping messages, sleeping
+#     in between. Additional threads could be given their
 #     own tees too.
 #
-from __future__ import print_function
-import gevent.monkey; gevent.monkey.patch_all() # needed for PySocks!
-import gevent, gevent.socket as socket
+
+import gevent.monkey; gevent.monkey.patch_all()   # needed for PySocks!
+import gevent
+import gevent.socket as socket
 from gevent.queue import Queue
 import bitcoin
 from bitcoin.messages import *
 from bitcoin.net import CAddress
-import time, sys, contextlib
-from io import BufferedReader
+import time
+import contextlib
+import io
+import random
 
 COLOR_RECV = '\033[95m'
 COLOR_SEND = '\033[94m'
 COLOR_ENDC = '\033[0m'
 
-PORT = 18333
+# Select bitcoin p2p params using python-bitcoinlib
 bitcoin.SelectParams('testnet')
+PORT = bitcoin.params.DEFAULT_PORT
+
+# Get DNS seeds, exclude schildbach, which is offline, and add provoost.
+SEEDS = [x[1] for x in bitcoin.params.DNS_SEEDS if "schildbach" not in x[1]]
+SEEDS.append("seed.testnet.bitcoin.sprovoost.nl")
+
+# Set a global block locator for testnet to the Genesis Block (used for getheaders)
+LOCATOR = bitcoin.net.CBlockLocator()
+LOCATOR.vHave.append(bitcoin.params.GENESIS_BLOCK.GetHash())
+
 
 # Turn a raw stream of Bitcoin p2p socket data into a stream of 
 # parsed messages.
 def msg_stream(f):
-    #f = BufferedReader(f)
+    f = io.BufferedReader(f)
     while True:
         yield MsgSerializable.stream_deserialize(f)
         
 
 def send(sock, msg): 
-    print(COLOR_SEND, 'Sent:', COLOR_ENDC, msg.command)
+    print(COLOR_SEND, 'Sent:    ', COLOR_ENDC, msg.command)
     msg.stream_serialize(sock)
 
+
 def tee_and_handle(f, msgs):
-    queue = Queue() # unbounded buffer
+    queue = Queue()     # unbounded buffer
+
     def _run():
         for msg in msgs:
-            print(COLOR_RECV, 'Received:', COLOR_ENDC, msg.command)
+            print(COLOR_RECV, 'Received:', COLOR_ENDC, msg.command)     # print `msg` for full message
             if msg.command == b'ping':
                 send(f, msg_pong(nonce=msg.nonce))
+            elif msg.command == b'headers':
+                # Update global with new best block header hash
+                LOCATOR.vHave.append(msg.headers[-1].GetHash())
             queue.put(msg)
     t = gevent.Greenlet(_run)
     t.start()
-    while True: yield(queue.get())
+    while True:
+        yield queue.get()
+
 
 def version_pkt(my_ip, their_ip):
     msg = msg_version()
-    msg.nVersion = 70002
+    # Leave this at 60002 unless you also patch python-bitcoinlib to match
+    # If you send messages (e.g. get_headers) with mis-matching versions, remote peer will disconnect
+    msg.nVersion = 60002
     msg.addrTo.ip = their_ip
     msg.addrTo.port = PORT
     msg.addrFrom.ip = my_ip
@@ -94,7 +116,8 @@ def version_pkt(my_ip, their_ip):
     msg.strSubVer = b"/tinybitcoinpeer.py/"
     return msg
 
-def addr_pkt( str_addrs ):
+
+def addr_pkt(str_addrs):
     msg = msg_addr()
     addrs = []
     for i in str_addrs:
@@ -102,22 +125,23 @@ def addr_pkt( str_addrs ):
         addr.port = PORT
         addr.nTime = int(time.time())
         addr.ip = i
-        addrs.append( addr )
+        addrs.append(addr)
     msg.addrs = addrs
     return msg
-    
+
+
 def main():
     with contextlib.closing(socket.socket()) as s, \
-         contextlib.closing(s.makefile('wb',0)) as writer, \
+         contextlib.closing(s.makefile('wb', 0)) as writer, \
          contextlib.closing(s.makefile('rb', 0)) as reader:
 
-        # This will actually return a random testnet node
-        their_ip = socket.gethostbyname("testnet-seed.bitcoin.schildbach.de")
-        print("Connecting to:", their_ip)
+        # This will return a random testnet node from a DNS seed
+        their_ip = socket.gethostbyname(random.choice(SEEDS))
+        print(" Connecting to:", their_ip)
 
         my_ip = "127.0.0.1"
 
-        s.connect( (their_ip,PORT) )
+        s.connect((their_ip, PORT))
         stream = msg_stream(reader)
 
         # Send Version packet
@@ -125,9 +149,9 @@ def main():
 
         # Receive their Version
         their_ver = next(stream)
-        print('Received:', their_ver)
+        print(COLOR_RECV, 'Received:', COLOR_ENDC, their_ver)
 
-        # Send Version acknolwedgement (Verack)
+        # Send Version acknowledgement (Verack)
         send(writer, msg_verack())
 
         # Fork off a handler, but keep a tee of the stream
@@ -135,14 +159,24 @@ def main():
 
         # Get Verack
         their_verack = next(stream)
+        print(COLOR_RECV, 'Received:', COLOR_ENDC, their_verack)
 
-        # Send a ping!
+        t = 0
         try:
             while True:
                 send(writer, msg_ping())
-                send(writer, msg_getaddr())
+                if t == 2:
+                    # Get some addresses
+                    send(writer, msg_getaddr())
+                if t == 4:
+                    # Get some headers
+                    _h = msg_getheaders()
+                    _h.locator = LOCATOR
+                    send(writer, _h)
                 gevent.sleep(5)
-        except KeyboardInterrupt: pass
+                t += 1
+        except KeyboardInterrupt:
+            pass
 
-try: __IPYTHON__
-except NameError: main()
+
+main()
