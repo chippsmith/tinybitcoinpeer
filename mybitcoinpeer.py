@@ -12,7 +12,7 @@ import contextlib
 import io
 import random
 
-###forked tiny bitcoinpper to send 'getdata' message in response to 'inv' message to get all the transactions
+###forked tiny bitcoinpeer to send 'getdata' message in response to 'inv' message to get all the transactions
 ### Also added sending "getaddr" message and parsed addr message in return and wrote results to ips.txt
 
 
